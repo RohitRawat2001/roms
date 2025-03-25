@@ -1,0 +1,249 @@
+// Notification service
+
+
+package com.roms.api.service;
+
+import com.roms.api.model.AssetTyreChangeActivity;
+import com.roms.api.model.ClientProjectSubteamMember;
+import com.roms.api.model.Employe;
+import com.roms.api.model.EmployeeDevices;
+import com.roms.api.model.EmployeeManagers;
+import com.roms.api.model.PushNotificationPayload;
+import com.roms.api.repository.EmployeeManagerRepository;
+import com.roms.api.utils.LoggedInUserDetails;
+import com.roms.api.utils.RolesAccessForApi;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.log4j.Log4j2;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+import org.springframework.web.client.RestTemplate;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+@Service
+@Log4j2
+@RequiredArgsConstructor
+public class ProjectSubteamMemberNofiticationService {
+
+    private final EmployeeDeviceService employeeDeviceService;
+    private final UserRolesMapService userRolesMapService;
+    private final LoggedInUserDetails loggedIn;
+    private final EmployeeManagerRepository employeeManagerRepository;
+
+    @Value("${notification.api.host}")
+    public String host;
+
+    @Value("${notification.api.port}")
+    public String port;
+
+    public String getNotificationURL(){
+        return "http://" +
+                host +
+                ":" +
+                port +
+                "/";
+    }
+
+    public void sendNotificationAfterCreation(ClientProjectSubteamMember activity,Employe employe){
+        try {
+            List<String> allDeviceTokens = getAllDeviceTokens();
+            List<EmployeeManagers> byManagers = employeeManagerRepository.findByManagers(employe);
+            List<String> managerTokens = new ArrayList<>();
+            for (EmployeeManagers manager : byManagers) {
+                managerTokens.addAll(employeeDeviceService.findAllByEmployee(manager.getId())
+                        .stream()
+                        .map(EmployeeDevices::getNotificationDeviceToken)
+                        .filter(Objects::nonNull)
+                        .distinct()
+                        .collect(Collectors.toList()));
+            }
+
+            allDeviceTokens.addAll(managerTokens);
+            String fromName = employe.getFirstName()+" "+employe.getLastName();
+            String message = "Project Subteam Member notification";
+            log.info("--------------------------------Project Subteam Member notification-----------------------");
+            sendNotification(employe.getId(),fromName,message,employe,allDeviceTokens,"Project Subteam Member Notification");
+
+        }catch (Exception e){
+            log.error("error while sending notification of tyre change activity",e);
+            throw new IllegalStateException(e.getMessage());
+        }
+    }
+
+
+    public void sendNotificationAfterReview(AssetTyreChangeActivity activity){
+        try {
+            String fromName = loggedIn.getUser().getEmployeId().getFirstName()+" "+loggedIn.getUser().getEmployeId().getLastName();
+            String message = fromName+" has reviewed and completed your tyre change form with "+activity.getQuantity()+" tyres for "+activity.getAsset().getAssetNo();
+            List<String> deviceTokens = employeeDeviceService.findAllResisterdDeviceOfEmployee(activity.getSupervisor().getId(),loggedIn.getOrg().getId());
+            sendNotification(activity.getId(),fromName,message,activity.getSupervisor(),deviceTokens,"Tyre Change review");
+        }catch (Exception e){
+            log.error("error while sending notification of tyre change activity review",e);
+            throw new IllegalStateException(e.getMessage());
+        }
+    }
+
+
+    private List<String> getAllDeviceTokens() {
+        List<String> deviceTokens = new ArrayList<>();
+
+        RolesAccessForApi.SUPER_USER_ROLE.forEach(role -> {
+            List<Employe> supervisorEmployees = userRolesMapService.findAllEmployeeByRoleName("ROLE_SUPERVISOR", loggedIn.getOrg().getId());
+            List<Employe> roleEmployees = userRolesMapService.findAllEmployeeByRoleName(role, loggedIn.getOrg().getId());
+
+            List<Employe> filteredEmployees;
+            if (loggedIn.getUser().getEmployeId() != null &&
+                    loggedIn.getUser().getEmployeId().getDepartments() != null &&
+                    !CollectionUtils.isEmpty(roleEmployees)) {
+
+
+                filteredEmployees = roleEmployees.stream()
+                        .filter(emp -> emp.getDepartments() != null &&
+                                emp.getDepartments().equals(loggedIn.getUser().getEmployeId().getDepartments()))
+                        .collect(Collectors.toList());
+            } else {
+                filteredEmployees = roleEmployees;
+            }
+            filteredEmployees.addAll(supervisorEmployees);
+
+            filteredEmployees.forEach(employee -> {
+                List<String> employeeDeviceTokens = employeeDeviceService.findAllByEmployee(employee.getId())
+                        .stream()
+                        .map(EmployeeDevices::getNotificationDeviceToken)
+                        .filter(Objects::nonNull)
+                        .distinct()
+                        .collect(Collectors.toList());
+
+                deviceTokens.addAll(employeeDeviceTokens);
+            });
+        });
+
+        return deviceTokens;
+    }
+
+
+    private void sendNotification(String id, String fromName, String message, Employe employe, List<String> allDeviceTokens,String title) {
+        RestTemplate restTemplate = new RestTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setAccept(List.of(MediaType.APPLICATION_JSON));
+        PushNotificationPayload requestPayload = new PushNotificationPayload();
+        requestPayload.setFrom(fromName);
+
+        requestPayload.setType("create");
+        requestPayload.setMessage(message);
+        requestPayload.setUsername(employe.getId());
+        Map<String ,Object> obj = new HashMap<>();
+        String value = CollectionUtils.isEmpty(employe.getProfileImage())?"system_pic": employe.getProfileImage().stream().map(obj1 -> obj1.getDigitalAssets().getUrl()).findFirst().orElse("system_pic");
+        obj.put("profileImage", value);
+        String time = String.valueOf(Instant.now().toEpochMilli());
+        obj.put("time", time);
+        obj.put("module", "asset_tyre_change");
+        obj.put("devices", allDeviceTokens);
+        obj.put("eventId", id);
+        obj.put("title",title);
+        log.info("final object :{}",obj);
+        requestPayload.setBody(obj);
+        log.info("request payload :{}",requestPayload);
+        HttpEntity<PushNotificationPayload> entity = new HttpEntity<>(requestPayload, headers);
+        restTemplate.exchange(
+                getNotificationURL() + "sendNotification", HttpMethod.POST, entity, String.class).getBody();
+        log.info("notification send successfully");
+    }
+
+}
+
+
+
+
+
+
+
+
+Then call this sendNotification method after the save of 
+
+projectSubteamMemberNofiticationService.sendNotificationAfterCreation(model,employeMOdel.get());
+
+that is inside this controller 
+
+
+
+// controller where this notification want to call
+  @PutMapping(value = "/addoperator/{gangId}/{employeeId}")
+    public ResponseEntity<?> employeeGangDetails(@PathVariable("gangId") String gangId,@PathVariable("employeeId") String employeeId) throws ChangeSetPersister.NotFoundException {
+        Map<String, Object> response = new HashMap<>();
+        String orgId= loggedIn.getOrg().getId();
+        String empId = loggedIn.getUser().getEmployeId().getId();
+        if (userRolesMapService.isSuperWiser(empId,orgId) || loggedIn.getUser().isSystemAdminFlag()){
+
+            ClientProjectSubteamMember model = new ClientProjectSubteamMember();
+            Optional<ClientProjectSubteam> gangmodel =  clientProjectSubteamService.findById(gangId);
+            if(gangmodel.isPresent()){
+                Optional<Employe> employeMOdel = employeService.findById(employeeId);
+
+                if(employeMOdel.isPresent()){
+                    ClientProjectSubteamMember gangmember = new ClientProjectSubteamMember();
+                    Optional<ClientProjectSubteamMember> gangMemberModel =   clientProjectSubteamMemberService.findEmployeeGangByEmploye(employeMOdel.get());
+                    if(gangMemberModel.isPresent()){
+                        gangmember = gangMemberModel.get();
+                    }
+                    gangmember.setClientProjectSubteam(gangmodel.get());
+                    gangmember.setEmployee(employeMOdel.get());
+                    gangmember.setStartDate(Instant.now());
+                    gangmember.setEndDate(null);
+                    try{
+                        gangmember = clientProjectSubteamMemberService.save(gangmember);
+                        List<EmployeeDisposition> empDispsitionList =   employeeDispositionService.findByEmployee(employeMOdel.get().getId());
+                        EmployeeDisposition employeeDisposition =new EmployeeDisposition();
+                        if(!empDispsitionList.isEmpty()){
+                            employeeDisposition =  empDispsitionList.get(0);
+                        }
+                        employeeDisposition.setEmploye(employeMOdel.get());
+                        employeeDisposition.setCode(gangmodel.get().getCode());
+                        employeeDisposition.setClientProjectSubteam(gangmodel.get());
+                        employeeDisposition.setTeamName(gangmodel.get().getTeamName());
+                        employeeDisposition =  employeeDispositionService.save(employeeDisposition);
+................................................................................................................................
+                        projectSubteamMemberNofiticationService.sendNotificationAfterCreation(model,employeMOdel.get());
+................................................................................................................................
+                        response.put("status","success");
+                        response.put("dispisitionId",employeeDisposition.getId());
+                    } catch (Exception e){
+                        response.put("status","error");
+                        response.put("error",e.getMessage());
+                        return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+                    }
+
+                }else {
+                    response.put("status","error");
+                    response.put("error","invalid_employee");
+                    return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+                }
+
+
+            }else {
+                response.put("status","error");
+                response.put("error","invalid_gang");
+                return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+            }
+
+
+            return new ResponseEntity<>(response, HttpStatus.OK);
+        }else{
+            response.put("status","error");
+            response.put("error","not_allowed");
+            return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+        }
+
+    }
+
